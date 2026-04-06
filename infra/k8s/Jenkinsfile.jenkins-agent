@@ -1,32 +1,7 @@
 // Jenkins Agent K8s 資源初始化
 // 用途：初次建叢集、或需要重建 jenkins-agents namespace 時跑
 pipeline {
-    agent {
-        kubernetes {
-            namespace 'jenkins-agents'
-            yaml """
-apiVersion: v1
-kind: Pod
-spec:
-  serviceAccountName: jenkins-agent
-  containers:
-  - name: jnlp
-    image: jenkins/inbound-agent:latest
-    resources:
-      requests:
-        cpu: 100m
-        memory: 256Mi
-  - name: aws-tools
-    image: 677856867919.dkr.ecr.ap-northeast-1.amazonaws.com/jenkins:latest
-    imagePullPolicy: Always
-    command: ["sleep", "infinity"]
-    resources:
-      requests:
-        cpu: 200m
-        memory: 512Mi
-"""
-        }
-    }
+    agent any
 
     environment {
         CLUSTER_NAME = "main-eks"
@@ -37,60 +12,43 @@ spec:
     stages {
         stage('Configure kubectl') {
             steps {
-                container('aws-tools') {
-                    sh "aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION} --kubeconfig /tmp/kubeconfig"
-                }
+                sh "aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION}"
             }
         }
 
         stage('Read SSM Parameters') {
             steps {
-                container('aws-tools') {
-                    script {
-                        env.AGENT_ROLE_ARN = sh(
-                            script: "aws ssm get-parameter --name ${SSM_PREFIX}/jenkins-agent-role-arn --region ${AWS_REGION} --query Parameter.Value --output text",
-                            returnStdout: true
-                        ).trim()
-                    }
+                script {
+                    env.AGENT_ROLE_ARN = sh(
+                        script: "aws ssm get-parameter --name ${SSM_PREFIX}/jenkins-agent-role-arn --region ${AWS_REGION} --query Parameter.Value --output text",
+                        returnStdout: true
+                    ).trim()
                 }
             }
         }
 
         stage('Apply Namespace and RBAC') {
             steps {
-                container('aws-tools') {
-                    sh """
-                        export KUBECONFIG=/tmp/kubeconfig
-                        kubectl apply -f infra/k8s/jenkins-agent-namespace.yaml
-                        kubectl apply -f infra/k8s/jenkins-agent-rbac.yaml
-                    """
-                }
+                sh "kubectl apply -f infra/k8s/jenkins-agent-namespace.yaml"
+                sh "kubectl apply -f infra/k8s/jenkins-agent-rbac.yaml"
             }
         }
 
         stage('Annotate ServiceAccount with IRSA') {
             steps {
-                container('aws-tools') {
-                    sh """
-                        export KUBECONFIG=/tmp/kubeconfig
-                        kubectl annotate sa jenkins-agent \
-                            -n jenkins-agents \
-                            eks.amazonaws.com/role-arn=${env.AGENT_ROLE_ARN} \
-                            --overwrite
-                    """
-                }
+                sh """
+                    kubectl annotate sa jenkins-agent \
+                        -n jenkins-agents \
+                        eks.amazonaws.com/role-arn=${env.AGENT_ROLE_ARN} \
+                        --overwrite
+                """
             }
         }
 
         stage('Verify') {
             steps {
-                container('aws-tools') {
-                    sh """
-                        export KUBECONFIG=/tmp/kubeconfig
-                        kubectl get sa jenkins-agent -n jenkins-agents -o yaml | grep role-arn
-                        kubectl get clusterrolebinding jenkins-agent-deploy
-                    """
-                }
+                sh "kubectl get sa jenkins-agent -n jenkins-agents -o yaml | grep role-arn"
+                sh "kubectl get clusterrolebinding jenkins-agent-deploy"
             }
         }
     }

@@ -1,8 +1,33 @@
 // 部署服務到 K8s
 // 用途：每次服務改版、新增服務時跑
-// 前提：ALB Controller 已安裝（Jenkinsfile）
+// 前提：ALB Controller 已安裝（Jenkinsfile.alb-controller）
 pipeline {
-    agent any
+    agent {
+        kubernetes {
+            namespace 'jenkins-agents'
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins-agent
+  containers:
+  - name: jnlp
+    image: jenkins/inbound-agent:latest
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+  - name: aws-tools
+    image: 677856867919.dkr.ecr.ap-northeast-1.amazonaws.com/jenkins:latest
+    imagePullPolicy: Always
+    command: ["sleep", "infinity"]
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+"""
+        }
+    }
 
     environment {
         CLUSTER_NAME = "main-eks"
@@ -12,52 +37,61 @@ pipeline {
     stages {
         stage('Configure kubectl') {
             steps {
-                sh "aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION}"
+                container('aws-tools') {
+                    sh "aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION} --kubeconfig /tmp/kubeconfig"
+                }
             }
         }
 
         stage('Read SSM Parameters') {
             steps {
-                script {
-                    env.WILDCARD_CERT_ARN = sh(
-                        script: "aws ssm get-parameter --name /shared/wildcard-cert-arn --region ${AWS_REGION} --query Parameter.Value --output text",
-                        returnStdout: true
-                    ).trim()
+                container('aws-tools') {
+                    script {
+                        env.WILDCARD_CERT_ARN = sh(
+                            script: "aws ssm get-parameter --name /shared/wildcard-cert-arn --region ${AWS_REGION} --query Parameter.Value --output text",
+                            returnStdout: true
+                        ).trim()
+                    }
                 }
             }
         }
 
         stage('Deploy App') {
             steps {
-                sh "kubectl apply -f infra/k8s/test-app.yaml"
-
-                sh """
-                    sed 's|\${WILDCARD_CERT_ARN}|${env.WILDCARD_CERT_ARN}|g' infra/k8s/ingress.yaml | kubectl apply -f -
-                """
+                container('aws-tools') {
+                    sh """
+                        export KUBECONFIG=/tmp/kubeconfig
+                        kubectl apply -f infra/k8s/test-app.yaml
+                        sed 's|\${WILDCARD_CERT_ARN}|${env.WILDCARD_CERT_ARN}|g' infra/k8s/ingress.yaml | kubectl apply -f -
+                    """
+                }
             }
         }
 
         stage('Verify') {
             steps {
-                sh "kubectl get pods -l app=test-app"
-                sh """
-                    echo "等待 ALB 建立..."
-                    for i in \$(seq 1 30); do
-                        ALB_DNS=\$(kubectl get ingress test-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
-                        if [ -n "\$ALB_DNS" ]; then
-                            echo ""
-                            echo "============================================"
-                            echo "ALB DNS name: \$ALB_DNS"
-                            echo "到 Cloudflare 加 CNAME: app → \$ALB_DNS"
-                            echo "============================================"
-                            exit 0
-                        fi
-                        echo "  (\$i/30) ADDRESS 還是空的，等 10 秒..."
-                        sleep 10
-                    done
-                    echo "超過 5 分鐘仍未取得 ALB DNS，請手動檢查：kubectl get ingress test-app"
-                    exit 1
-                """
+                container('aws-tools') {
+                    sh """
+                        export KUBECONFIG=/tmp/kubeconfig
+                        kubectl get pods -l app=test-app
+                        echo "等待 ALB 建立..."
+                        for i in \$(seq 1 30); do
+                            ALB_DNS=\$(kubectl get ingress test-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+                            if [ -n "\$ALB_DNS" ]; then
+                                echo ""
+                                echo "============================================"
+                                echo "ALB DNS name: \$ALB_DNS"
+                                echo "到 Cloudflare 加 CNAME: app → \$ALB_DNS"
+                                echo "============================================"
+                                exit 0
+                            fi
+                            echo "  (\$i/30) ADDRESS 還是空的，等 10 秒..."
+                            sleep 10
+                        done
+                        echo "超過 5 分鐘仍未取得 ALB DNS，請手動檢查：kubectl get ingress test-app"
+                        exit 1
+                    """
+                }
             }
         }
     }

@@ -6,6 +6,7 @@ USER root
 RUN apt-get update && apt-get install -y \
     curl \
     unzip \
+    gettext-base \
     && rm -rf /var/lib/apt/lists/*
 
 # Install AWS CLI
@@ -18,13 +19,7 @@ RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tm
 RUN curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl \
     && chmod +x /usr/local/bin/kubectl
 
-# Install Helm (download, verify checksum, then install)
-ENV HELM_VERSION=v3.17.3
-RUN curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" -o /tmp/helm.tar.gz \
-    && curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz.sha256sum" -o /tmp/helm.sha256 \
-    && cd /tmp && sha256sum -c helm.sha256 \
-    && tar -xzf helm.tar.gz \
-    && mv linux-amd64/helm /usr/local/bin/helm \
-    && rm -rf /tmp/helm.tar.gz /tmp/helm.sha256 /tmp/linux-amd64
+# Install Helm
+RUN curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
 USER jenkins

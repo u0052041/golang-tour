@@ -32,17 +32,22 @@ infra/
     ├── variables.tf     ← cluster_name、node 規格等變數
     ├── locals.tf        ← common_tags
     ├── data.tf          ← remote state + Jenkins SG data source
-    ├── eks.tf           ← EKS Cluster + OIDC Provider + Jenkins Access Entry
+    ├── eks.tf           ← EKS Cluster + OIDC Provider + Jenkins/Agent Access Entry
     ├── iam.tf           ← Cluster Role + Node Role + Policy Attachments
     ├── node-group.tf    ← Managed Node Group
     ├── sg.tf            ← Jenkins → EKS API 443 ingress rule
-    ├── alb-controller.tf← ALB Controller IRSA + SSM Parameters
+    ├── alb-controller.tf    ← ALB Controller IRSA + SSM Parameters
+    ├── jenkins-agent-irsa.tf← Jenkins Agent IRSA Role + SSM Parameter
     ├── outputs.tf       ← cluster endpoint、CA cert、ALB Role ARN
-    ├── ingress.yaml               ← Ingress 規則（envsubst 注入 cert ARN）
-    ├── test-app.yaml              ← 測試用 Deployment + Service + PDB
-    ├── policies/                  ← ALB Controller IAM Policy JSON
-    ├── Jenkinsfile.alb-controller ← 安裝/升級 ALB Controller
-    └── Jenkinsfile.ingress        ← 部署/更新 Ingress 規則
+    ├── ingress.yaml                 ← test-app Ingress（group.order: 100）
+    ├── ingress-login-service.yaml   ← login-service Ingress（/auth，group.order: 20）
+    ├── test-app.yaml                ← 測試用 Deployment + Service + PDB
+    ├── jenkins-agent-namespace.yaml ← jenkins-agents Namespace
+    ├── jenkins-agent-rbac.yaml      ← SA + ClusterRole + ClusterRoleBinding
+    ├── policies/                    ← ALB Controller IAM Policy JSON
+    ├── Jenkinsfile.alb-controller   ← 安裝/升級 ALB Controller
+    ├── Jenkinsfile.ingress          ← 部署/更新 Ingress 規則（含 login-service）
+    └── Jenkinsfile.jenkins-agent    ← K8s 資源初始化（namespace、RBAC、IRSA annotation）
 ```
 
 網路層用 `terraform_remote_state` 共享，k8s 模組從 `../networking/terraform.tfstate` 讀 VPC 和 subnet。
@@ -85,13 +90,68 @@ access_config {
 
 `bootstrap_cluster_creator_admin_permissions = true` 讓建叢集的 IAM 身份自動拿到 admin 權限，不然連建完的人自己都進不去。
 
+### bootstrap_self_managed_addons = false
+
+```hcl
+bootstrap_self_managed_addons = false
+```
+
+告訴 EKS 不要自動安裝 self-managed 版本的 kube-proxy、vpc-cni、coredns。改用 EKS Managed Addon（由 AWS 管理版本與更新），升級時不需要自己跑 kubectl。
+
 ### Control Plane Logging
 
+目前**未啟用** Control Plane logging（`enabled_cluster_log_types` 未設定）。
+
+若需開啟，至少加：
 ```hcl
 enabled_cluster_log_types = ["api", "audit", "authenticator"]
 ```
+- `audit`：記錄誰做了什麼操作（生產環境建議開）
+- `authenticator`：debug IAM / IRSA 問題用
 
-Prod 環境至少開 `audit`（誰做了什麼）和 `authenticator`（debug IAM / IRSA 問題）。Log 會送到 CloudWatch Logs，注意 log 量大時會有費用。
+Log 會送到 CloudWatch Logs，注意 log 量大時有費用，視需求決定是否開啟。
+
+### Node Group 設定
+
+```hcl
+instance_types = ["t3.medium"]   # 2 vCPU, 4 GB
+scaling_config {
+    desired_size = 2
+    min_size     = 2
+    max_size     = 2
+}
+update_config {
+    max_unavailable = 1           # rolling update：每次最多替換 1 個 node
+}
+```
+
+Node Role 掛的 IAM Policy：
+
+| Policy | 用途 |
+|--------|------|
+| `AmazonEKSWorkerNodePolicy` | Node 加入 Cluster 的基本權限 |
+| `AmazonEKS_CNI_Policy` | vpc-cni 插件管理 Pod 網路（分配 ENI/IP） |
+| `AmazonEC2ContainerRegistryReadOnly` | Node 從 ECR pull image（read-only） |
+| `AmazonSSMManagedInstanceCore` | Node 可用 SSM Session Manager 連入，不需要開 SSH |
+
+### EBS CSI Driver
+
+EKS 1.23+ 不再內建 EBS provisioner，需要額外安裝 EBS CSI Driver 才能動態建立 PersistentVolume（如 StatefulSet 用的 EBS）。
+
+**部署方式**：Terraform 管 AWS 側（IRSA + Addon），不需要 Helm。
+
+```
+Terraform 管：
+  1. IAM Role（ebs-csi-role）← OIDC federation 給 kube-system:ebs-csi-controller-sa
+  2. AmazonEBSCSIDriverPolicy 掛到 ebs-csi-role
+  3. aws_eks_addon "aws-ebs-csi-driver" ← 由 AWS 管理版本
+
+K8s 側（Addon 自動建）：
+  4. ebs-csi-controller-sa（含 IRSA annotation）
+  5. CSI controller + node DaemonSet
+```
+
+為什麼用 `aws_eks_addon` 而不是 Helm？EBS CSI 屬於叢集基礎設施（跟 kube-proxy、vpc-cni 同層），用 AWS Managed Addon 讓 AWS 負責版本相容性與安全更新，不需要自己追蹤 Helm chart 版本。
 
 ---
 
@@ -128,20 +188,40 @@ resource "aws_eks_access_entry" "jenkins" {
 }
 
 resource "aws_eks_access_policy_association" "jenkins" {
-    policy_arn = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminPolicy"
+    policy_arn = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+    access_scope { type = "cluster" }
+}
+
+resource "aws_eks_access_entry" "jenkins_agent" {
+    cluster_name  = "main-eks"
+    principal_arn = aws_iam_role.jenkins_agent.arn
+    type          = "STANDARD"
+}
+
+resource "aws_eks_access_policy_association" "jenkins_agent" {
+    policy_arn = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
     access_scope { type = "cluster" }
 }
 ```
 
 這是 EKS 新的權限管理方式（取代 `aws-auth` ConfigMap）：
-- `access_entry` — 聲明「jenkins-role 可以存取這個叢集」
-- `access_policy_association` — 給予 `Admin` 權限，scope 是整個叢集
+- `access_entry` — 聲明「哪個 IAM Role 可以存取這個叢集」
+- `access_policy_association` — 給予 `AmazonEKSClusterAdminPolicy`（叢集 Admin）
+
+專案同時為兩個 Role 建立 access entry：
+1. **jenkins-role**（Jenkins Controller EC2 用）— 跑 infra pipeline
+2. **jenkins-agent Role**（EKS Pod 用）— 跑 deploy pipeline
 
 ```
 Jenkins EC2 → assume jenkins-role → 呼叫 EKS API
                                      ↓
                         EKS 查 Access Entry：
-                        "jenkins-role 有 Admin，放行"
+                        "jenkins-role 有 ClusterAdmin，放行"
+
+Agent Pod  → assume jenkins-agent → 呼叫 EKS API
+                                     ↓
+                        EKS 查 Access Entry：
+                        "jenkins-agent 有 ClusterAdmin，放行"
 ```
 
 ### 資料傳遞：SSM Parameters
@@ -224,7 +304,13 @@ terraform init && terraform apply
 
 ### ACM cert ARN 注入方式
 
-ingress.yaml 裡的 `certificate-arn` 用 `${WILDCARD_CERT_ARN}` 佔位符，部署時透過 `sed` 注入實際值（Jenkins container 沒有 `envsubst`，用 `sed` 替代）。
+ingress.yaml 裡的 `certificate-arn` 用 `${WILDCARD_CERT_ARN}` 佔位符，部署時透過 `envsubst` 注入實際值：
+
+```bash
+export WILDCARD_CERT_ARN=$(aws ssm get-parameter --name /shared/wildcard-cert-arn --query Parameter.Value --output text)
+envsubst < infra/k8s/ingress.yaml | kubectl apply -f -
+envsubst < infra/k8s/ingress-login-service.yaml | kubectl apply -f -
+```
 
 cert ARN 存在 SSM Parameter `/shared/wildcard-cert-arn`，跟 ALB Controller 的 SSM pattern 一致（`/eks/main-eks/*`）。這樣做的原因：
 - cert ARN 包含 AWS Account ID，不適合 hardcode 在 YAML 裡
@@ -233,13 +319,26 @@ cert ARN 存在 SSM Parameter `/shared/wildcard-cert-arn`，跟 ALB Controller �
 
 ### Ingress 設計決策
 
-**Ingress Group**：所有服務共用同一個 ALB（`group.name: main`），用 host-based routing 分流。這樣做是因為每個 ALB 約 $16/月，共用一個可以省成本，未來加服務只需要新增 ingress rule。
+**Ingress Group**：所有服務共用同一個 ALB（`group.name: main`），用 path-based / host-based routing 分流。每個 ALB 約 $16/月，共用一個可以省成本。
+
+**多 Ingress 管理**：每個服務有獨立的 ingress.yaml，透過 `group.order` 控制 path 匹配優先級：
+
+| 檔案 | 服務 | Path | group.order |
+|------|------|------|-------------|
+| `ingress.yaml` | test-app | `/`（catch-all） | 100 |
+| `ingress-login-service.yaml` | app-login-service | `/auth` | 20 |
+
+`group.order` 數字越小越優先，`/auth` 先被匹配到 login-service，其他 path 落到 test-app（`/`）。
 
 **HTTPS**：ALB 同時監聽 HTTP:80 和 HTTPS:443，HTTP 自動 301 redirect 到 HTTPS。cert 使用 networking 層的 wildcard `*.u0052041.com`。
 
 **TLS Policy**：使用 `ELBSecurityPolicy-TLS13-1-2-2021-06`，只允許 TLS 1.2 和 1.3，符合 prod security baseline。
 
 **Target Type**：使用 `ip` 模式（而非 `instance`），ALB 直接連到 Pod IP，不經過 NodePort，延遲更低。
+
+**Health Check**：每個服務可以設定不同的 health check path：
+- test-app：`/`（nginx 預設 200）
+- app-login-service：`/health`（FastAPI health endpoint）
 
 ### Terraform 和 Helm 的分工
 
@@ -319,9 +418,14 @@ K8s 側（YAML）：
   6. ClusterRole + ClusterRoleBinding（kubectl 操作權限）
 ```
 
+Jenkins Agent IAM Policy 包含：
+- `SSMParameterRead`：讀取 `/eks/*` 和 `/shared/*` 的 Parameter
+- `EKSAccess`：DescribeCluster / ListClusters
+- `ECRPush`：push/pull ECR image（`ecr:PutImage`、`ecr:InitiateLayerUpload` 等）
+
 與 ALB Controller IRSA 的差異：
 - ALB Controller 需要操作 AWS 資源（建 ALB、改 SG）→ 權限範圍廣
-- Jenkins Agent 只需要讀 SSM + describe EKS → 最小權限
+- Jenkins Agent 需要讀 SSM + describe EKS + ECR push（deploy 時 build + push image）
 
 ### Jenkinsfile 改法
 

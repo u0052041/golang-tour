@@ -139,6 +139,15 @@ terraform apply -var="enable_alb=true"   # 開
 
 ALB 關掉（destroy）後重新建立，DNS name 會不同，需要到 Cloudflare 更新 CNAME。
 
+### Health Check 與 TLS Policy
+
+Target Group health check：
+- **path**：`/login`（Jenkins 未登入會 302 redirect，所以不能用 `/`）
+- **matcher**：`200,302`（必須同時接受 302，否則健康檢查會一直失敗）
+- healthy_threshold：2 / unhealthy_threshold：3
+
+HTTPS Listener 使用 `ELBSecurityPolicy-TLS13-1-2-2021-06`，只允許 TLS 1.2 和 1.3，與 EKS Ingress 的 TLS policy 保持一致。
+
 ---
 
 ## Step 5：Security Group（sg.tf）
@@ -169,6 +178,10 @@ aws_volume_attachment → 掛載到 EC2（/dev/xvdf 或 /dev/nvme1n1）
 
 EBS 有 `prevent_destroy = true`，`terraform destroy` EC2 不會刪掉資料。
 
+**靜態加密**：EC2 root volume（`root_block_device { encrypted = true }`）和 EBS 資料卷（`encrypted = true`）都啟用靜態加密，使用 AWS 管理金鑰（KMS 預設）。
+
+**`user_data_replace_on_change = false`**：改動 `user_data` 不會觸發 EC2 重建。這是刻意設計的——user_data 只在第一次開機時跑，EC2 跑起來後更新 Jenkins 是透過 `null_resource.jenkins_container_update`（SSM 送指令），而不是換 EC2。若需強制重跑 user_data，用 `-replace=aws_instance.jenkins`。
+
 user_data 啟動流程：
 1. 安裝 Docker
 2. 等待 EBS 裝置出現（最多等 150 秒）
@@ -198,6 +211,10 @@ aws_ecr_repository        → 存放 custom Jenkins image
 aws_ecr_lifecycle_policy  → 只保留最近 5 個 image
 null_resource             → Dockerfile 變動時自動 build + push
 ```
+
+Repository 設定細節：
+- **`image_tag_mutability = "MUTABLE"`**：允許覆蓋同一個 tag（如 `latest`）。每次 build 都 push 到 `latest`，EC2 pull 時永遠拿最新版。若改成 `IMMUTABLE`，同 tag 不能覆蓋，需要改用帶版本號的 tag 策略。
+- **`scan_on_push = true`**：每次 push image 時，ECR 自動掃描 OS 層套件的 CVE 漏洞。結果在 AWS Console → ECR → Repositories → jenkins → Images 查看。不影響 push 流程（掃到漏洞不會阻擋 push）。
 
 ### Cross-Platform Build
 
@@ -239,7 +256,7 @@ terraform apply \
 | `aws_iam_role` (jenkins) | EC2 掛的 role |
 | `AmazonSSMManagedInstanceCore` | SSM Session Manager（不需要 SSH）|
 | `jenkins-eks-policy` | SSM Parameter 讀取 + EKS DescribeCluster |
-| `AmazonEC2ContainerRegistryReadOnly` | 從 ECR 拉 Jenkins image |
+| `AmazonEC2ContainerRegistryPowerUser` | ECR push/pull（build image + 拉 Jenkins image）|
 | `aws_iam_instance_profile` | EC2 與 IAM Role 的橋樑 |
 
 EC2 不能直接掛 Role，需透過 `instance_profile`。

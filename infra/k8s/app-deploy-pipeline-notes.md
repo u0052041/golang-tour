@@ -8,7 +8,7 @@ nav_order: 12
 # App CD Pipeline 筆記
 {: .no_toc }
 
-GitHub Actions CI + Jenkins CD 的分工架構、Kaniko image build、自動 rollback
+整套 CI/CD 架構、GitHub Actions CI + Jenkins CD 分工、Kaniko build、Deployment 設計、流量路徑
 {: .fs-6 .fw-300 }
 
 ## 目錄
@@ -19,7 +19,69 @@ GitHub Actions CI + Jenkins CD 的分工架構、Kaniko image build、自動 rol
 
 ---
 
-## 一、CI/CD 分工架構
+## 一、整套 CI/CD 架構總覽
+
+整套系統分成兩類 pipeline：**Infra Pipeline**（基礎設施，手動觸發）和 **App Pipeline**（服務，自動觸發）。
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   Infra Pipelines                   │
+│              （jack-wiki repo，手動觸發）              │
+│                                                     │
+│  Jenkinsfile.alb-controller → 安裝 ALB Controller   │
+│  Jenkinsfile.jenkins-agent  → 建 RBAC + IRSA        │
+│  Jenkinsfile.ingress        → 部署 Ingress 規則      │
+└────────────────────┬────────────────────────────────┘
+                     │ 建好基礎設施後
+                     ▼
+┌─────────────────────────────────────────────────────┐
+│                   App Pipeline                      │
+│           （app repo，每次 push 自動觸發）             │
+│                                                     │
+│  GitHub Actions CI                                  │
+│    lint → type check → test → coverage              │
+│         │ main push + CI 通過                       │
+│         ▼                                           │
+│  curl Jenkins API                                   │
+│         │                                           │
+│         ▼                                           │
+│  Jenkins CD（K8s agent pod）                         │
+│    Setup → Kaniko build → ECR push → deploy → verify│
+│                                      │ 失敗          │
+│                                      ▼              │
+│                               kubectl rollout undo  │
+└─────────────────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────┐
+│                  EKS Cluster                        │
+│                                                     │
+│  app.u0052041.com/auth  → app-login-service (×2)   │
+│  app.u0052041.com/      → test-app (×2)             │
+│                                                     │
+│  共用同一個 ALB（group.name: main）                  │
+└─────────────────────────────────────────────────────┘
+                     ▲
+              Cloudflare CNAME
+                     ▲
+                  使用者
+```
+
+### Infra vs App 分工原則
+
+| | Infra Pipeline | App Pipeline |
+|---|---|---|
+| 管理 repo | jack-wiki | app-login-service |
+| 觸發方式 | Jenkins 手動觸發 | GitHub Actions 自動 |
+| 執行頻率 | 初次建叢集 / 有變更時 | 每次 push main |
+| agent | `agent any`（Jenkins Master） | `agent kubernetes`（K8s Pod）|
+| 管什麼 | ALB Controller、Ingress 規則、RBAC | 服務 image build + deploy |
+
+**Ingress 由 Infra repo 集中管理**，不放在 app repo。原因：Ingress 規則涉及多服務的 path 優先序（`group.order`）和共用 ALB 設定，集中管理可以避免多個 app 各自改 Ingress 造成衝突。
+
+---
+
+## 二、CI/CD 分工架構
 
 GitHub Actions 只負責 **CI**（品質檢查），Jenkins 只負責 **CD**（build image + deploy）。兩者透過 Jenkins API 串接：
 
@@ -266,3 +328,124 @@ Jenkins Agent IAM Policy 已包含 ECR push 所需的 action（`ecr:PutImage`、
 | `JENKINS_URL` | `https://jenkins.u0052041.com` |
 | `JENKINS_USER` | Jenkins 帳號 |
 | `JENKINS_TOKEN` | Jenkins API Token（不是密碼） |
+
+---
+
+## 七、Deployment 設計
+
+### 基本設定
+
+```yaml
+replicas: 2          # 兩個 pod，搭配 PDB 確保 rolling update 時至少 1 個在跑
+namespace: default
+```
+
+### Pod Security Context
+
+```yaml
+securityContext:
+  runAsNonRoot: true     # 禁止以 root 跑 container
+  runAsUser: 1001
+  fsGroup: 1001
+```
+
+Container 層：
+```yaml
+securityContext:
+  allowPrivilegeEscalation: false   # 禁止提權
+  readOnlyRootFilesystem: false     # FastAPI 需要寫入（log、tmp），保持 false
+```
+
+### Resource Limits
+
+```yaml
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+```
+
+`requests` 是 K8s scheduler 用來決定放到哪個 node 的依據；`limits` 是容器的上限，超過 CPU limit 會被 throttle，超過 memory limit 會被 OOMKill。
+
+### Readiness / Liveness Probe
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  initialDelaySeconds: 10   # 等 10 秒才開始探，讓 app 有時間啟動
+  periodSeconds: 10
+  failureThreshold: 3        # 連續失敗 3 次才標記為 not ready
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  initialDelaySeconds: 20   # liveness 比 readiness 晚開始，避免啟動中就被殺
+  periodSeconds: 30
+  failureThreshold: 3        # 連續失敗 3 次才重啟 pod
+```
+
+兩個 probe 的差異：
+- **readiness**：pod not ready → 從 Service Endpoint 移除，不再收流量，但 pod 不重啟
+- **liveness**：pod not alive → K8s 重啟 pod
+
+### PodDisruptionBudget
+
+```yaml
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: app-login-service
+```
+
+保證 rolling update 或 node drain 時，至少 1 個 pod 持續服務。配合 `replicas: 2`，同時只能下線 1 個 pod。
+
+### Secret 注入
+
+```yaml
+envFrom:
+  - secretRef:
+      name: app-login-service-secret
+```
+
+把 Secret 裡所有 key-value 一次全部注入為環境變數（`SECRET_KEY`、`DATABASE_URL`、`ENVIRONMENT`），不需要逐一列出。
+
+---
+
+## 八、流量路徑
+
+```
+使用者
+  │ HTTPS app.u0052041.com
+  ▼
+Cloudflare（CNAME → ALB DNS）
+  │ TLS 終止在 ALB
+  ▼
+ALB（internet-facing，ELBSecurityPolicy-TLS13-1-2-2021-06）
+  │
+  ├─ /auth  → Target Group: app-login-service（group.order: 20）
+  │               │ target-type: ip（直打 Pod IP）
+  │               ▼
+  │           app-login-service Pod :8000
+  │
+  └─ /      → Target Group: test-app（group.order: 100）
+                  │ target-type: ip
+                  ▼
+              test-app Pod :8080（nginx）
+```
+
+### 關鍵設計點
+
+**`target-type: ip`**：ALB 直接打 Pod IP（透過 ENI），不經過 NodePort。延遲更低，也不受 node 數量限制。
+
+**共用 ALB（`group.name: main`）**：所有服務共用同一個 ALB，每個 ALB 約 $16/月，不需要每個服務各建一個。
+
+**path 優先序（`group.order`）**：數字小的先匹配。`/auth`（order 20）比 `/`（order 100）先判斷，所以 `/auth` 的請求不會誤落到 test-app。
+
+**Health Check**：ALB 直接對 Pod IP 打 `/health`（app-login-service）或 `/`（test-app），health check 失敗的 Pod 自動從 Target Group 移除。
